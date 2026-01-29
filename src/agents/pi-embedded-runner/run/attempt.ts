@@ -396,11 +396,16 @@ export async function runEmbeddedAttempt(
         .then(() => true)
         .catch(() => false);
 
+      const authMode = resolveModelAuthMode(params.model.provider, params.config);
       const transcriptPolicy = resolveTranscriptPolicy({
         modelApi: params.model?.api,
         provider: params.provider,
         modelId: params.modelId,
+        modelAuthMode: authMode,
       });
+      log.info(
+        `transcript policy: authMode=${authMode} sanitizeToolCallIds=${transcriptPolicy.sanitizeToolCallIds} sanitizeMode=${transcriptPolicy.sanitizeMode}`,
+      );
 
       await prewarmSessionFile(params.sessionFile);
       sessionManager = guardSessionManager(SessionManager.open(params.sessionFile), {

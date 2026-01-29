@@ -67,6 +67,8 @@ export function resolveTranscriptPolicy(params: {
   modelApi?: string | null;
   provider?: string | null;
   modelId?: string | null;
+  /** Auth mode for the current request (oauth/token require stricter sanitization on Anthropic). */
+  modelAuthMode?: "api-key" | "oauth" | "token" | "mixed" | "aws-sdk" | "unknown";
 }): TranscriptPolicy {
   const provider = normalizeProviderId(params.provider ?? "");
   const modelId = params.modelId ?? "";
@@ -85,7 +87,14 @@ export function resolveTranscriptPolicy(params: {
 
   const needsNonImageSanitize = isGoogle || isAnthropic || isMistral || isOpenRouterGemini;
 
-  const sanitizeToolCallIds = isGoogle || isMistral;
+  // OAuth/token on Anthropic uses Cloud Code Assist API which requires strict tool call IDs
+  // "mixed" means both api_key and token/oauth profiles exist - still need sanitization
+  const isAnthropicOAuth =
+    isAnthropic &&
+    (params.modelAuthMode === "oauth" ||
+      params.modelAuthMode === "token" ||
+      params.modelAuthMode === "mixed");
+  const sanitizeToolCallIds = isGoogle || isMistral || isAnthropicOAuth;
   const toolCallIdMode: ToolCallIdMode | undefined = isMistral
     ? "strict9"
     : sanitizeToolCallIds
