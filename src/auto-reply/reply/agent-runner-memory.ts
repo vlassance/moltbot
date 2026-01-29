@@ -12,6 +12,7 @@ import {
 } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { TemplateContext } from "../templating.js";
 import type { VerboseLevel } from "../thinking.js";
 import type { GetReplyOptions } from "../types.js";
@@ -23,6 +24,8 @@ import {
 } from "./memory-flush.js";
 import type { FollowupRun } from "./queue.js";
 import { incrementCompactionCount } from "./session-updates.js";
+
+const log = createSubsystemLogger("memory-flush");
 
 export async function runMemoryFlushIfNeeded(params: {
   cfg: MoltbotConfig;
@@ -39,7 +42,10 @@ export async function runMemoryFlushIfNeeded(params: {
   isHeartbeat: boolean;
 }): Promise<SessionEntry | undefined> {
   const memoryFlushSettings = resolveMemoryFlushSettings(params.cfg);
-  if (!memoryFlushSettings) return params.sessionEntry;
+  if (!memoryFlushSettings) {
+    log.debug("memory flush disabled in config");
+    return params.sessionEntry;
+  }
 
   const memoryFlushWritable = (() => {
     if (!params.sessionKey) return true;
@@ -52,24 +58,49 @@ export async function runMemoryFlushIfNeeded(params: {
     return sandboxCfg.workspaceAccess === "rw";
   })();
 
+  const sessionEntry =
+    params.sessionEntry ??
+    (params.sessionKey ? params.sessionStore?.[params.sessionKey] : undefined);
+  const contextWindowTokens = resolveMemoryFlushContextWindowTokens({
+    modelId: params.followupRun.run.model ?? params.defaultModel,
+    agentCfgContextTokens: params.agentCfgContextTokens,
+  });
+  const totalTokens = sessionEntry?.totalTokens ?? 0;
+  const threshold =
+    contextWindowTokens -
+    memoryFlushSettings.reserveTokensFloor -
+    memoryFlushSettings.softThresholdTokens;
+
+  const isCliProv = isCliProvider(params.followupRun.run.provider, params.cfg);
+  const shouldFlushResult = shouldRunMemoryFlush({
+    entry: sessionEntry,
+    contextWindowTokens,
+    reserveTokensFloor: memoryFlushSettings.reserveTokensFloor,
+    softThresholdTokens: memoryFlushSettings.softThresholdTokens,
+  });
+
+  log.info(
+    `evaluating: totalTokens=${totalTokens} threshold=${threshold} contextWindow=${contextWindowTokens} ` +
+      `reserve=${memoryFlushSettings.reserveTokensFloor} soft=${memoryFlushSettings.softThresholdTokens} ` +
+      `compactionCount=${sessionEntry?.compactionCount ?? 0} lastFlushAt=${sessionEntry?.memoryFlushCompactionCount ?? "none"}`,
+  );
+
   const shouldFlushMemory =
     memoryFlushSettings &&
     memoryFlushWritable &&
     !params.isHeartbeat &&
-    !isCliProvider(params.followupRun.run.provider, params.cfg) &&
-    shouldRunMemoryFlush({
-      entry:
-        params.sessionEntry ??
-        (params.sessionKey ? params.sessionStore?.[params.sessionKey] : undefined),
-      contextWindowTokens: resolveMemoryFlushContextWindowTokens({
-        modelId: params.followupRun.run.model ?? params.defaultModel,
-        agentCfgContextTokens: params.agentCfgContextTokens,
-      }),
-      reserveTokensFloor: memoryFlushSettings.reserveTokensFloor,
-      softThresholdTokens: memoryFlushSettings.softThresholdTokens,
-    });
+    !isCliProv &&
+    shouldFlushResult;
 
-  if (!shouldFlushMemory) return params.sessionEntry;
+  if (!shouldFlushMemory) {
+    const reasons: string[] = [];
+    if (!memoryFlushWritable) reasons.push("workspace not writable");
+    if (params.isHeartbeat) reasons.push("heartbeat run");
+    if (isCliProv) reasons.push("CLI provider");
+    if (!shouldFlushResult) reasons.push(`tokens ${totalTokens} < threshold ${threshold}`);
+    log.info(`skipped: ${reasons.join(", ")}`);
+    return params.sessionEntry;
+  }
 
   let activeSessionEntry = params.sessionEntry;
   const activeSessionStore = params.sessionStore;
@@ -87,6 +118,13 @@ export async function runMemoryFlushIfNeeded(params: {
   ]
     .filter(Boolean)
     .join("\n\n");
+
+  const flushStartTime = Date.now();
+  log.info(
+    `STARTING memory flush run: sessionKey=${params.sessionKey} runId=${flushRunId} ` +
+      `totalTokens=${totalTokens} threshold=${threshold}`,
+  );
+
   try {
     await runWithModelFallback({
       cfg: params.followupRun.run.config,
@@ -145,6 +183,7 @@ export async function runMemoryFlushIfNeeded(params: {
             if (evt.stream === "compaction") {
               const phase = typeof evt.data.phase === "string" ? evt.data.phase : "";
               const willRetry = Boolean(evt.data.willRetry);
+              log.info(`compaction event during flush: phase=${phase} willRetry=${willRetry}`);
               if (phase === "end" && !willRetry) {
                 memoryCompactionCompleted = true;
               }
@@ -153,11 +192,18 @@ export async function runMemoryFlushIfNeeded(params: {
         });
       },
     });
+
+    const flushDurationMs = Date.now() - flushStartTime;
+    log.info(
+      `COMPLETED memory flush run: durationMs=${flushDurationMs} compactionTriggered=${memoryCompactionCompleted}`,
+    );
+
     let memoryFlushCompactionCount =
       activeSessionEntry?.compactionCount ??
       (params.sessionKey ? activeSessionStore?.[params.sessionKey]?.compactionCount : 0) ??
       0;
     if (memoryCompactionCompleted) {
+      log.info("compaction completed during memory flush, incrementing compaction count");
       const nextCount = await incrementCompactionCount({
         sessionEntry: activeSessionEntry,
         sessionStore: activeSessionStore,
@@ -182,11 +228,12 @@ export async function runMemoryFlushIfNeeded(params: {
           activeSessionEntry = updatedEntry;
         }
       } catch (err) {
-        logVerbose(`failed to persist memory flush metadata: ${String(err)}`);
+        log.warn(`failed to persist memory flush metadata: ${String(err)}`);
       }
     }
   } catch (err) {
-    logVerbose(`memory flush run failed: ${String(err)}`);
+    const flushDurationMs = Date.now() - flushStartTime;
+    log.error(`FAILED memory flush run: durationMs=${flushDurationMs} error=${String(err)}`);
   }
 
   return activeSessionEntry;
